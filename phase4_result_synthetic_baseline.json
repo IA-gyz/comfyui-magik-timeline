@@ -1,0 +1,45 @@
+{
+  "arms": {
+    "control": {
+      "arm": "control",
+      "description": "no pin at the first sampler; original HR pins at the second. The baseline: a standard single-resolution refine pass.",
+      "seam_ratio": 1.0046,
+      "verdict": "seamless",
+      "at_frames": 13.6,
+      "boundary_ratio": 0.8493,
+      "composition_drift": 0.0804,
+      "delivered_frames": 141,
+      "latent_steps": 42,
+      "seam_d_index": 11
+    },
+    "test_path_c": {
+      "arm": "test_path_c",
+      "description": "LR pixel-grade pin at the first sampler (Path C: the source file re-encoded at stage-1 resolution); HR pin at the second. The dual-resolution mode shipped in 0.3.0.",
+      "seam_ratio": 1.0826,
+      "verdict": "seamless",
+      "at_frames": 0.0,
+      "boundary_ratio": 1.0826,
+      "composition_drift": 0.0003,
+      "delivered_frames": 141,
+      "latent_steps": 42,
+      "seam_d_index": 11
+    },
+    "ref_hard_cut": {
+      "arm": "ref_hard_cut",
+      "description": "",
+      "seam_ratio": 1.9147,
+      "verdict": "hard cut",
+      "at_frames": 0.0,
+      "boundary_ratio": 1.9147,
+      "composition_drift": 0.0003,
+      "delivered_frames": 141,
+      "latent_steps": 42,
+      "seam_d_index": 11
+    }
+  },
+  "acceptance": {
+    "accept": true,
+    "reasons": []
+  },
+  "sanity_ref_hard_cut_verdicts_hard_cut": true
+}

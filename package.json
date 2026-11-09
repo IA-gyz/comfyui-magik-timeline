@@ -1,0 +1,9 @@
+{
+  "name": "comfyui-magik-timeline",
+  "private": true,
+  "description": "Dev-time only: node test deps for tests/*.mjs. Not shipped to ComfyUI (WEB_DIRECTORY serves web/ directly).",
+  "type": "module",
+  "devDependencies": {
+    "linkedom": "^0.18.12"
+  }
+}

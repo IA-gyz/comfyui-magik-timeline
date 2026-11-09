@@ -1,0 +1,624 @@
+# Magik Timeline -- ported from comfyui-obvpm-timeline v0.1.4
+# (GPL-3.0). Provenance and identity mapping: docs/MAGIK_PORT.md
+"""MAGIK_H3LoadVideoWithMCtx: clip picker with sidecar verification.
+
+Mirrors the core Load Video idea but browses the OUTPUT folder (where
+takes land) and adds mctx awareness: when a sidecar pairs with the file
+(hash-verified), the clip's full latents + header ride out on the MCTX
+wire. No sidecar, or a failed pairing check, emits None -- route the
+IMAGE/AUDIO outputs through MAGIK_H3MCtxFromFrames instead.
+"""
+
+import logging
+import os
+
+import folder_paths
+
+from . import avpack
+from . import frames as fr
+from . import wiretypes as wt
+from . import mctx
+
+_LOG = logging.getLogger("magik.h3")
+
+# create_pins convenience modes on the loaders: the two everyday pins,
+# collapsing Load -> PinSpec -> Apply to Load -> Apply. Anything fancier
+# (at_frame cuts, audio windows, multi-pin stacks) is MAGIK_H3MCtxPinSpec's job.
+_PIN_MODES = {
+    "none": None,
+    "extend (pin tail)": ("tail", "before"),
+    "prepend (pin head)": ("head", "after"),
+}
+
+
+def resolve_clip_path(clip):
+    """Output-relative clip -> absolute path, refusing anything outside.
+
+    The Timeline's source arrives as serialized widget text, so traversal
+    is guarded HERE, once, rather than at each caller.
+
+    Confined by the path AS WRITTEN, like core ComfyUI's /view and the
+    rest of this pack (saving, the result preview, the hunt): `..`,
+    absolute and drive paths cannot leave the output folder, but a
+    symlink or Windows junction INSIDE it is followed wherever it points.
+    Only someone with the machine's files can put one there, and a
+    project folder linked to another drive is exactly what it is for.
+    (This used to resolve links first, so takes saved into such a folder
+    -- saving checked the path as written -- were listed and then
+    refused as "escaping" when extended, loaded or upscaled.)
+    """
+    root = os.path.abspath(folder_paths.get_output_directory())
+    path = os.path.abspath(os.path.join(root, str(clip)))
+    try:
+        inside = path != root and os.path.commonpath([root, path]) == root
+    except ValueError:              # another drive
+        inside = False
+    if not inside:
+        raise ValueError(
+            "magik.h3: %s escapes the output folder; clips are "
+            "output-relative paths only." % clip)
+    if not os.path.isfile(path):
+        raise ValueError(
+            "magik.h3: %s does not exist under the output folder (moved "
+            "or deleted since it was picked?)." % clip)
+    return path
+
+
+def synthetic_header(path):
+    """A header for a clip with no trustworthy sidecar: identity, no more.
+
+    A plain video has no latents and no lineage -- but it does have an
+    IDENTITY (its content hash) and a length, and those two facts are all
+    the seam machinery needs from the LEFT side of a join. Supplying them
+    is what lets a take pinned from imported footage name it as a parent,
+    the seam between them be derived instead of guessed, and level lock /
+    crossfade (both pixel-domain) act on that join at all.
+
+    `no_sidecar` marks it, so nothing mistakes the absence of latents for
+    the presence of them: there is nothing here to slice, only something
+    to point at.
+    """
+    from . import nodes_encode as ne
+    info = ne.probe_clip(path)
+    n = str(int(info["frames"]))
+    return {
+        "format": mctx.FORMAT,
+        "self_id": _cached_hash(path),
+        "parent_id": "", "relation": "", "parent_join_frame": "0",
+        "width": str(info["width"]), "height": str(info["height"]),
+        "fps": str(fr.FPS),
+        "raw_frames": n, "delivered_frames": n,
+        "pinned_head_frames": "0", "pinned_tail_frames": "0",
+        "pins": "[]", "user_meta": "",
+        "no_sidecar": "1",
+    }
+
+
+def verified_bundle_or_none(clip):
+    """The clip's bundle when its sidecar can be trusted, else None.
+
+    None means exactly one thing: "there are no latents here you may
+    rely on" -- no sidecar at all, or one that no longer pairs with the
+    video. Both are cases the PIXEL route can still serve, so this
+    reports them rather than refusing, and callers that require latents
+    turn None into a refusal themselves (load_verified_bundle).
+
+    A missing file or a traversal attempt still raises. Those are not
+    "no latents", they are wrong.
+    """
+    path = resolve_clip_path(clip)
+    side = mctx.sidecar_path(path)
+    if not os.path.isfile(side):
+        return None
+    header = mctx.read_header(side)
+    actual = _cached_hash(path)
+    if header.get("self_id") != actual:
+        _LOG.warning(
+            "magik.h3: %s does not pair with its sidecar (re-encoded, "
+            "edited or swapped since the take was saved); its latents "
+            "cannot be trusted", clip)
+        return None
+    video_lat, audio_lat, header = mctx.load_sidecar(side)
+    return mctx.make_mctx(actual, video_lat, audio_lat, header,
+                          origin="sampled", clip=clip)
+
+
+def load_verified_bundle(clip):
+    """Output-relative clip -> verified MCTX bundle, video never decoded.
+
+    The shared trust path for every LATENT continuation that starts from
+    a filename instead of a wire (MAGIK_H3LoadMCtx). Refuses rather than
+    degrading: a caller that can accept pixel grade should ask
+    verified_bundle_or_none and route accordingly.
+    """
+    bundle = verified_bundle_or_none(clip)
+    if bundle is not None:
+        return bundle
+    path = resolve_clip_path(clip)
+    if not os.path.isfile(mctx.sidecar_path(path)):
+        raise ValueError(
+            "magik.h3: %s has no .mctx.safetensors sidecar. Only clips "
+            "saved by the H3 MCtx save nodes carry one; for plain videos "
+            "use MAGIK_H3LoadVideoWithMCtx + the pixel route." % clip)
+    raise ValueError(
+        "magik.h3: %s does not pair with its sidecar (the video was "
+        "re-encoded, edited or swapped since the take was saved). "
+        "Latent continuation refused." % clip)
+
+
+def _create_pins(bundle, clip, create_pins, pin_window, at_frame=None,
+                 pin_mode="masked", mask_shape=None):
+    """`at_frame` = the timeline CUT to continue from, in delivered frames.
+
+    None means the clip's own edge (its tail for an extend, its head for
+    a prepend). With a cut, an extend pins the window ENDING at the cut
+    and a prepend pins the window STARTING there -- so "extend from the
+    current cut" needs no separate code path. The grid shift below then
+    applies to that frame exactly as it does to a clip edge, which is
+    what makes a freely-dragged (off-grid) cut still pin soundly.
+    """
+    mode = _PIN_MODES[create_pins]
+    if mode is None:
+        return []
+    if bundle is None:
+        raise ValueError(
+            "create_pins is '%s' but %s has no verified sidecar -- there "
+            "are no latents to pin. Re-save the take with an H3 MCtx save "
+            "node, set create_pins to none, or take the pixel route: "
+            "images/audio -> H3 MCtx From Frames -> H3 MCtx Pin Spec "
+            "(encoded, so pixel-grade rather than exact)."
+            % (create_pins, clip))
+    take_from, place = mode
+    prepend = take_from == "head"
+
+    # Continuation clips have off-grid edges: a pinned head pushes the
+    # delivered content 5 past a group boundary (prepend case), a pinned
+    # tail pulls the delivered end 12 short of one (extending a
+    # prepend-made clip). The manual PinSpec refuses those cuts and makes
+    # the user pick a frame; the convenience mode shifts to the nearest
+    # latent-grade cut itself and says where the seam will land. The new
+    # clip's pins recipe records the shifted join, so assembly needs no
+    # extra bookkeeping.
+    meta = bundle["meta"]
+    ph = int(meta.get("pinned_head_frames", 0) or 0)
+    pt = int(meta.get("pinned_tail_frames", 0) or 0)
+    delivered = int(meta.get("delivered_frames", 0) or 0)
+    w = int(pin_window)
+    if at_frame is None:
+        end = w if take_from == "head" else delivered
+    else:
+        cut = int(at_frame)
+        end = cut + w if take_from == "head" else cut
+    off = (ph + end - w) % fr.FRAMES_PER_GROUP
+    take_from_frame = 0
+    # The room is the take's whole stored latent, not only what it
+    # delivered: a take made by extending another one keeps the frames it
+    # held from that clip (its pinned head), a take made by prepending
+    # keeps the ones it led into (its pinned tail). A window may reach
+    # into them -- a very short take, or a cut close to its start, can
+    # still be continued -- and the join does not move: the new take
+    # still starts at the cut. (A window that needs no shifting is left
+    # to Apply Pins, which may snap it down to what there is.)
+    if off:
+        if take_from == "head":
+            end += fr.FRAMES_PER_GROUP - off
+            if end > delivered + pt:
+                raise ValueError(
+                    "create_pins: %s is too short to prepend to -- the "
+                    "first latent-grade window ends at frame %d but only "
+                    "%d frames were delivered%s." % (
+                        clip, end, delivered,
+                        " (+%d held from the clip it leads into)" % pt
+                        if pt else ""))
+            skip = end - w
+            _LOG.info(
+                "magik.h3: %s: head sits off the latent grid (continuation "
+                "clip); prepend window shifted to end at frame %d. The new "
+                "clip leads into this one at frame %d -- assemble as "
+                "new + this[%d:].", clip, end, skip, skip)
+        else:
+            end -= off
+            if ph + end < w:
+                raise ValueError(
+                    "create_pins: %s is too short to extend -- no "
+                    "latent-grade %d-frame window fits before frame %d%s."
+                    % (clip, w, delivered,
+                       " (even reaching %d frames back into the clip it "
+                       "continues)" % ph if ph else ""))
+            _LOG.info(
+                "magik.h3: %s: tail sits off the latent grid (pinned-tail "
+                "clip); extend window shifted to end at frame %d, skipping "
+                "the last %d delivered frames. The new clip continues from "
+                "frame %d -- assemble as this[:%d] + new.",
+                clip, end, off, end, end)
+        take_from, take_from_frame = "at_frame", end
+    if prepend and end > delivered:
+        _LOG.info(
+            "magik.h3: %s: the %d-frame prepend window reaches %d frames "
+            "into the clip this one leads into (its held tail).",
+            clip, w, end - delivered)
+    if not prepend and 0 <= end < w <= ph + end:
+        _LOG.info(
+            "magik.h3: %s: the %d-frame extend window reaches %d frames "
+            "back into the clip this one continues (its held head); the "
+            "new take still continues from frame %d.",
+            clip, w, w - end, end)
+
+    # An explicit cut must be honoured whether or not it needed shifting.
+    # This used to sit inside the `if off:` branch, so a cut that was
+    # ALREADY latent-grade -- which is what the widget's snapping
+    # produces -- fell through and pinned the clip's own edge instead.
+    if at_frame is not None:
+        take_from, take_from_frame = "at_frame", end
+
+    from .nodes_pins import MAGIK_H3MCtxPinSpec
+    ramp, edge, hold = mask_shape or (0, 0.0, 0.0)
+    (specs,) = MAGIK_H3MCtxPinSpec().build(
+        mctx=bundle, window=pin_window, take_from=take_from,
+        take_from_frame=take_from_frame, place=place, place_at_frame=0,
+        audio_window=0, mode=pin_mode, mask_ramp_frames=ramp,
+        mask_ramp_edge=edge, mask_hold=hold)
+    return specs
+
+
+def prepend_end(meta, pin_window, at_frame=None):
+    """Where a prepend's window ENDS in the clip's delivered frames: `w`
+    on from the cut (or the clip's head), after the shift onto the
+    latent grid _create_pins applies. Past the frames the clip holds
+    (delivered + pinned tail), the clip alone cannot supply it."""
+    ph = int(meta.get("pinned_head_frames", 0) or 0)
+    w = int(pin_window)
+    end = (0 if at_frame is None else int(at_frame)) + w
+    off = (ph + end - w) % fr.FRAMES_PER_GROUP
+    return end + (fr.FRAMES_PER_GROUP - off if off else 0)
+
+
+def prepend_through(bundle, next_bundle, next_clip, create_pins,
+                    pin_window, at_frame=None, pin_mode="masked",
+                    mask_shape=None):
+    """A prepend whose window runs past the end of `bundle`'s clip, taken
+    from the take that continues it -- or None when `next_bundle` is no
+    such take or does not hold the window.
+
+    The take after a clip on the timeline, when it extends that clip,
+    stores the clip's frames it continued from (its held head) and then
+    its own: one continuous latent, identical to the clip's own over the
+    held part. So a prepend at a cut close to the clip's end slices the
+    window from there -- the clip's frames up to the take's join, then
+    the take's -- which is exactly what the timeline plays after the
+    cut. The specs are the take's, marked `via` the clip: Apply slices
+    the take and records the pin as the clip's (nodes_pins._seen_from),
+    so the new take leads into the clip at the cut, as asked, and every
+    reader of its recipe finds the clip it visibly leads into.
+    """
+    meta, nmeta = bundle["meta"], next_bundle["meta"]
+    befores = [s for s in mctx.parse_pins(nmeta)
+               if s.get("place") == "before"
+               and s.get("source_kind") == "clip"
+               and s.get("source_id") == bundle.get("self_id")]
+    if len(befores) != 1:
+        return None
+    p = befores[0]
+    s = int(p.get("source_start", 0) or 0)
+    ph, nph = (int(m.get("pinned_head_frames", 0) or 0)
+               for m in (meta, nmeta))
+    # the take's raw frame r is the clip's raw frame s + r
+    cut_raw = (0 if at_frame is None else int(at_frame)) + ph
+    if cut_raw < s:
+        return None             # starts before what the take holds
+    try:
+        specs = _create_pins(next_bundle, next_clip, create_pins, pin_window,
+                             at_frame=cut_raw - s - nph, pin_mode=pin_mode,
+                             mask_shape=mask_shape)
+    except ValueError:
+        return None
+    a0 = p.get("audio_start_step")
+    via = {"source_id": bundle.get("self_id", ""),
+           # the take's raw frames -> the clip's raw frames
+           "raw_offset": s,
+           # the take's FILE frames -> the clip's (a pixel pin reads the
+           # file): its delivered frame 0 is its raw nph
+           "file_offset": s + nph - ph,
+           # the take's audio steps -> the clip's (its held sound starts
+           # on the clip's step a0); unknown for an older take
+           "audio_offset": None if a0 is None else int(a0),
+           "source_path": (str(bundle["clip"]).replace("\\", "/")
+                           if bundle.get("clip") else "")}
+    for spec in specs:
+        spec["via"] = via
+    _LOG.info("magik.h3: the prepend window runs past the end of %s; it "
+              "is taken from %s, which continues it (the clip's frames up "
+              "to their join, then its own)",
+              bundle.get("clip") or bundle.get("self_id", "")[:12], next_clip)
+    return specs
+
+
+def _create_pixel_pins(clip, create_pins, pin_window, at_frame=None,
+                       pin_mode="masked", mask_shape=None):
+    """The same convenience pin, for a clip with no usable sidecar.
+
+    Deliberately does NOT mirror _create_pins' grid-shifting: that exists
+    because a latent slice must begin at cycle phase 0, and an encode
+    defines phase 0 wherever the window starts. So a pixel pin honours
+    the cut it was given, exactly, and never announces a shifted seam.
+
+    Nothing is resolved here -- not the frame count, not the fps, not
+    even whether the file opens. Apply owns that, because Apply is where
+    the VAE and the target resolution are, and a spec is pure data.
+    """
+    mode = _PIN_MODES[create_pins]
+    if mode is None:
+        return []
+    take_from, place = mode
+    w = int(pin_window)
+    take_from_frame = 0
+    if at_frame is not None:
+        cut = int(at_frame)
+        # "at_frame" always names the frame the window ENDS at: an extend
+        # leaves the clip at the cut, a prepend leads into it from there.
+        take_from, take_from_frame = "at_frame", (
+            cut + w if take_from == "head" else cut)
+    return [{
+        "source": None,
+        "source_id": "",            # nothing to verify: the take is a root
+        "source_kind": "clip_pixels",
+        "source_path": clip,
+        "take_from": take_from,
+        "take_from_frame": take_from_frame,
+        "requested_window": w,
+        # placeholders; Apply resolves the real range against the file
+        "source_start": 0,
+        "source_frames": w,
+        "place": place,
+        "place_at_frame": 0,
+        "audio_window": 0,
+        "mode": pin_mode,
+        "mask_ramp_frames": int((mask_shape or (0,))[0]),
+        "mask_ramp_edge": float((mask_shape or (0, 0.0))[1]),
+        "mask_hold": float((mask_shape or (0, 0.0, 0.0))[2]),
+    }]
+
+
+_PIN_INPUTS = {
+    "create_pins": (list(_PIN_MODES), {
+        "default": "none",
+        "tooltip": "Also emit a ready-made pin spec for this clip: "
+                   "'extend' pins its tail so the next generation "
+                   "continues after it; 'prepend' pins its head so the "
+                   "next generation leads into it. Off-grid edges of "
+                   "continuation clips are auto-shifted to the nearest "
+                   "latent-grade cut (the log states the seam frame). "
+                   "Wire pin_specs straight to MAGIK_H3MCtxApplyPins. Use "
+                   "MAGIK_H3MCtxPinSpec instead for explicit at_frame cuts, "
+                   "audio windows or multi-pin stacks."}),
+    "pin_window": (list(fr.WINDOW_CHOICES), {
+        "default": "39",
+        "tooltip": "Context window for create_pins. 39 is the everyday "
+                   "choice (and the shortest masked-legal window); 90 "
+                   "pins more motion at the cost of more "
+                   "of the new clip."}),
+}
+
+_VIDEO_EXTS = (".mp4", ".mkv", ".webm", ".mov")
+_SCAN_DEPTH = 3
+
+# hash cache: {abs_path: (size, mtime_ns, sha256)}. Disposable memoization,
+# never authority.
+_HASH_CACHE = {}
+
+
+def _list_clips():
+    """Video files under the output folder, relative paths, depth-limited.
+
+    Linked folders (symlinks, Windows junctions) are walked like real
+    ones -- see resolve_clip_path -- unless the real folder they lead to
+    was already walked, so a link pointing back up the tree neither
+    loops nor lists the same clips again. Real folders are always walked:
+    a link never takes a folder's place in the list.
+    """
+    root = folder_paths.get_output_directory()
+    out = []
+    seen = {os.path.normcase(os.path.realpath(root))}
+    for dirpath, dirnames, filenames in os.walk(root, followlinks=True):
+        rel = os.path.relpath(dirpath, root)
+        depth = 0 if rel == "." else rel.count(os.sep) + 1
+        if depth >= _SCAN_DEPTH:
+            dirnames[:] = []
+        dirnames[:] = _walkable(seen, dirpath, dirnames)
+        for f in filenames:
+            if f.lower().endswith(_VIDEO_EXTS):
+                p = f if rel == "." else os.path.join(rel, f)
+                out.append(p.replace(os.sep, "/"))
+    out.sort()
+    return out
+
+
+def _walkable(seen, dirpath, names):
+    """The subfolders of `dirpath` a walk should enter: every real one
+    (marked in `seen`), then each link whose real folder is not marked
+    yet. `seen` holds normcased real paths."""
+    here = os.path.realpath(dirpath)
+    plain, links = [], []
+    for name in names:
+        real = os.path.normcase(os.path.realpath(os.path.join(dirpath, name)))
+        if real == os.path.normcase(os.path.join(here, name)):
+            plain.append(name)
+            seen.add(real)
+        else:
+            links.append((name, real))
+    for name, real in links:
+        if real not in seen:
+            seen.add(real)
+            plain.append(name)
+    return plain
+
+
+def _cached_hash(path):
+    st = os.stat(path)
+    key = os.path.abspath(path)
+    hit = _HASH_CACHE.get(key)
+    if hit and hit[0] == st.st_size and hit[1] == st.st_mtime_ns:
+        return hit[2]
+    digest = mctx.hash_file(path)
+    _HASH_CACHE[key] = (st.st_size, st.st_mtime_ns, digest)
+    return digest
+
+
+class MAGIK_H3LoadMCtx:
+    """MCTX-only loader: pick a clip, get its verified bundle -- no decode.
+
+    The lean continuation path: when a graph only needs the latents (the
+    standard extend), decoding the MP4 is pure waste. This loader
+    hash-verifies the pairing and reads the sidecar; the video itself is
+    never opened. Use MAGIK_H3LoadVideoWithMCtx when you also want frames/audio.
+    """
+
+    CATEGORY = "magik/h3"
+    FUNCTION = "load"
+    RETURN_TYPES = (wt.MCTX, wt.PINSPECS, "LATENT")
+    RETURN_NAMES = ("mctx", "pin_specs", "latent")
+    DESCRIPTION = (
+        "Loads ONLY a clip's motion-context bundle (latents + lineage) "
+        "from its verified sidecar -- the video is never decoded, so this "
+        "is the fast path for extend graphs. Refuses when no sidecar "
+        "pairs with the file (unlike the full loader, there is no pixel "
+        "route to fall back to here). The `latent` output hands the "
+        "stored AV latent straight back to a sampler or an upscaler, "
+        "with no VAE round trip to lose grade to."
+    )
+    OUTPUT_TOOLTIPS = (
+        "The clip's latents + header for the pins pipeline.",
+        "Ready-made pin spec per create_pins; empty when none.",
+        "The clip's stored AV latent (video + audio), exactly as the "
+        "sampler produced it. Split it with Separate AV Latent to reach "
+        "the video stream on its own.",
+    )
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        clips = _list_clips()
+        return {
+            "required": {
+                "clip": (clips if clips else [""], {
+                    "tooltip": "A video in the output folder with an mctx "
+                               "sidecar (saved by the H3 MCtx save "
+                               "nodes)."}),
+                **_PIN_INPUTS,
+            },
+        }
+
+    @classmethod
+    def IS_CHANGED(cls, clip, **_):
+        return MAGIK_H3LoadVideoWithMCtx.IS_CHANGED(clip)
+
+    @classmethod
+    def VALIDATE_INPUTS(cls, clip, **_):
+        return MAGIK_H3LoadVideoWithMCtx.VALIDATE_INPUTS(clip)
+
+    def load(self, clip, create_pins="none", pin_window="22"):
+        clip = (clip or "").strip()
+        if not clip:
+            raise ValueError(
+                "magik.h3: MAGIK_H3LoadMCtx has no clip -- the picker is empty. "
+                "To drive the clip from a wire, use H3 MCtx Load by Path.")
+        bundle = load_verified_bundle(clip)
+        meta = bundle["meta"]
+        _LOG.info("magik.h3: %s mctx loaded (%s, %s frames delivered), "
+                  "video not decoded", clip,
+                  meta.get("relation") or "root",
+                  meta.get("delivered_frames"))
+        return (bundle,
+                _create_pins(bundle, clip, create_pins, pin_window),
+                avpack.pack_av(bundle["video_latent"], bundle["audio_latent"],
+                               clip))
+
+
+class MAGIK_H3LoadVideoWithMCtx:
+    CATEGORY = "magik/h3"
+    FUNCTION = "load"
+    RETURN_TYPES = ("VIDEO", "IMAGE", "AUDIO", wt.MCTX, wt.PINSPECS)
+    RETURN_NAMES = ("video", "images", "audio", "mctx", "pin_specs")
+    DESCRIPTION = (
+        "Loads a clip from the output folder with motion-context "
+        "awareness: when a hash-verified .mctx.safetensors sidecar pairs "
+        "with the file, its latents + lineage ride out on the mctx output "
+        "for exact latent-grade continuation. Without one (or when the "
+        "video was re-encoded/swapped), mctx is None and only the pixel "
+        "route is available."
+    )
+    OUTPUT_TOOLTIPS = (
+        "The clip as a VIDEO object (core-compatible).",
+        "Decoded frames.",
+        "Decoded audio track.",
+        "The clip's latents + header for the pins pipeline; None when no "
+        "verified sidecar pairs with this file.",
+        "Ready-made pin spec per create_pins; empty when none.",
+    )
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        clips = _list_clips()
+        return {
+            "required": {
+                "clip": (clips if clips else [""], {
+                    "tooltip": "A video in the output folder. Clips saved by "
+                               "MAGIK_H3SaveVideoWithMCtx carry a sidecar and load "
+                               "with exact continuation latents."}),
+                **_PIN_INPUTS,
+            },
+        }
+
+    @classmethod
+    def IS_CHANGED(cls, clip, **_):
+        path = os.path.join(folder_paths.get_output_directory(), clip)
+        parts = []
+        for p in (path, mctx.sidecar_path(path)):
+            try:
+                st = os.stat(p)
+                parts.append("%d:%d" % (st.st_size, st.st_mtime_ns))
+            except OSError:
+                parts.append("absent")
+        return "|".join(parts)
+
+    @classmethod
+    def VALIDATE_INPUTS(cls, clip, **_):
+        if not clip:
+            return "no clip selected (the output folder has no videos)"
+        path = os.path.join(folder_paths.get_output_directory(), clip)
+        if not os.path.isfile(path):
+            return "clip not found: %s" % path
+        return True
+
+    def load(self, clip, create_pins="none", pin_window="22"):
+        path = os.path.join(folder_paths.get_output_directory(), clip)
+        from comfy_api.input_impl import VideoFromFile
+        video = VideoFromFile(path)
+        components = video.get_components()
+        images, audio = components.images, components.audio
+
+        bundle = None
+        side = mctx.sidecar_path(path)
+        if os.path.isfile(side):
+            try:
+                header = mctx.read_header(side)
+                actual = _cached_hash(path)
+                if header.get("self_id") != actual:
+                    _LOG.warning(
+                        "magik.h3: %s does not pair with its sidecar (the "
+                        "video was re-encoded, edited or swapped since the "
+                        "take was saved). Latent continuation refused; the "
+                        "pixel route still works.", clip)
+                else:
+                    video_lat, audio_lat, header = mctx.load_sidecar(side)
+                    bundle = mctx.make_mctx(actual, video_lat, audio_lat,
+                                            header, origin="sampled",
+                                            clip=clip)
+                    _LOG.info(
+                        "magik.h3: %s + verified sidecar (%s, %s frames "
+                        "delivered)", clip, header.get("relation") or "root",
+                        header.get("delivered_frames"))
+            except Exception:
+                _LOG.exception("magik.h3: failed to read sidecar %s; loading "
+                               "the clip without it", side)
+        return (video, images, audio, bundle,
+                _create_pins(bundle, clip, create_pins, pin_window))
