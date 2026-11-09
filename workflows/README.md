@@ -14,6 +14,7 @@ Use the latest workflow where possible. Older ones are kept for reference or in 
 - **Needs [comfyui-obvpm](https://github.com/chanon/comfyui-obvpm) 0.2.16 or newer** (and comfyui-magik-timeline 0.1.4 or newer). With 0.2.16, a workflow first opened while an older comfyui-obvpm was installed no longer loses the names its Get nodes read by (#47), and a model in a hidden field -- the turbo LoRA while `turbo_loader` is off -- no longer brings up ComfyUI's "Missing Models" warning; switched on and missing, it does.
 - The **H3 Model** override now holds `minimax_h3_ref2va_pruned_int8_convrot.safetensors`, the engine presets' own model, instead of `minimax_h3_hybrid_fl2va_ref2va_b30-49.safetensors`, which has since been renamed where it is published (#47). The override is still off by default.
 - The **lightx2v** engine preset uses the published `minimax_h3_ref2v_turbo_8step_v1.0_768p_comfyui_bf16.safetensors` from [lightx2v/Minimax-h3-Turbo](https://huggingface.co/lightx2v/Minimax-h3-Turbo) at 8 steps (it named a file that is not published), and sets the model to `minimax_h3_ref2va_pruned_int8_convrot.safetensors`.
+- **Reference inputs of the MiniMax H3 Reference to Video node are now 1-based in every workflow in this folder**: `ref_image_1`-`ref_image_9`, `ref_video_1`-`ref_video_3`, `ref_video_audio_1`-`ref_video_audio_3`, `ref_audio_1`-`ref_audio_3` (previously `..._0`-based). Only names/labels changed; links bind by slot index, so the wiring is untouched.
 
 ## v0.1.4-007 (2026-10-08)
 
